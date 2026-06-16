@@ -63,6 +63,101 @@ def _validate_upload(uploaded_file) -> Optional[str]:
     return None
 
 
+def render_status_stepper(status: RequestStatus, assigned_to: str = None, forward_count: int = 0) -> None:
+    """4-korački HTML/CSS vizuelni tracker napretka predmeta."""
+    if status == RequestStatus.DRAFT:
+        return
+
+    _STEPS = [
+        (0, "Podnesen"),
+        (1, "U obradi"),
+        (2, "Odluka"),
+        (3, "Završen"),
+    ]
+
+    _STATUS_TO_STEP = {
+        RequestStatus.SUBMITTED:     0,
+        RequestStatus.UNDER_REVIEW:  1,
+        RequestStatus.PENDING_USER:  1,
+        RequestStatus.APPROVED:      2,
+        RequestStatus.REJECTED:      2,
+        RequestStatus.COMPLETED:     3,
+    }
+
+    is_rejected = status == RequestStatus.REJECTED
+    is_pending  = status == RequestStatus.PENDING_USER
+    cur_step    = _STATUS_TO_STEP.get(status, -1)
+
+    parts = []
+    for i, (step_idx, step_label) in enumerate(_STEPS):
+        if step_idx == 2:
+            if is_rejected:
+                step_label = "Odbijen"
+            elif cur_step >= 2:
+                step_label = "Odobren"
+
+        if cur_step > step_idx:
+            cls, dot = "done", "✓"
+        elif cur_step == step_idx:
+            if is_rejected:
+                cls, dot = "rejected", "✗"
+            elif is_pending:
+                cls, dot = "pending", str(i + 1)
+            else:
+                cls, dot = "active", str(i + 1)
+        else:
+            cls, dot = "future", str(i + 1)
+
+        parts.append(
+            f'<div class="dms-step">'
+            f'<div class="dms-dot {cls}">{dot}</div>'
+            f'<div class="dms-lbl {cls}">{step_label}</div>'
+            f'</div>'
+        )
+        if i < len(_STEPS) - 1:
+            conn = "done" if cls == "done" else ""
+            parts.append(f'<div class="dms-conn {conn}"></div>')
+
+    extras = ""
+    if is_pending:
+        extras += '<div class="dms-sub">⏳ Čeka vašu dopunu dokumentacije</div>'
+    if assigned_to:
+        extras += f'<div class="dms-sub">👤 Obrađuje: <b>{assigned_to}</b></div>'
+    if forward_count and forward_count > 0:
+        extras += f'<div class="dms-sub">↪ Predmet proslijeđen {forward_count}× — u obradi</div>'
+
+    html = (
+        "<style>"
+        ".dms-stepper{display:flex;align-items:flex-start;padding:12px 0 2px;gap:0}"
+        ".dms-step{display:flex;flex-direction:column;align-items:center;min-width:80px}"
+        ".dms-dot{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;"
+        "justify-content:center;font-weight:700;font-size:.82rem;"
+        "border:2px solid #dee2e6;background:#f8f9fa;color:#adb5bd}"
+        ".dms-dot.done{background:#198754;border-color:#198754;color:#fff}"
+        ".dms-dot.active{background:#0d6efd;border-color:#0d6efd;color:#fff;"
+        "box-shadow:0 0 0 3px rgba(13,110,253,.2)}"
+        ".dms-dot.pending{background:#6f42c1;border-color:#6f42c1;color:#fff;"
+        "box-shadow:0 0 0 3px rgba(111,66,193,.2)}"
+        ".dms-dot.rejected{background:#dc3545;border-color:#dc3545;color:#fff;"
+        "box-shadow:0 0 0 3px rgba(220,53,69,.2)}"
+        ".dms-lbl{margin-top:5px;font-size:.7rem;text-align:center;"
+        "color:#adb5bd;max-width:80px;line-height:1.2}"
+        ".dms-lbl.done{color:#198754;font-weight:500}"
+        ".dms-lbl.active{color:#0d6efd;font-weight:700}"
+        ".dms-lbl.pending{color:#6f42c1;font-weight:700}"
+        ".dms-lbl.rejected{color:#dc3545;font-weight:700}"
+        ".dms-conn{flex:1;height:2px;background:#dee2e6;margin-top:15px;min-width:16px}"
+        ".dms-conn.done{background:#198754}"
+        ".dms-sub{font-size:.76rem;color:#6c757d;margin-top:4px}"
+        "</style>"
+        '<div class="dms-stepper">'
+        + "".join(parts)
+        + "</div>"
+        + extras
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _service_catalog() -> dict:
     return {
         "MUP (polu-digitalno)": [
@@ -426,6 +521,12 @@ def my_requests_page() -> None:
                     )
                 with c3:
                     st.write(f"Tip toka: {mode_label}")
+
+                render_status_stepper(
+                    request.status,
+                    assigned_to=request.assigned_to,
+                    forward_count=getattr(request, "forward_count", 0) or 0,
+                )
 
                 if request.details and request.details.get("physical_presence_required"):
                     st.warning("Za ovu uslugu je potreban fizički dolazak u završnoj fazi.")

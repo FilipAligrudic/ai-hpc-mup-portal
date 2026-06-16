@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import Enum as PyEnum
 import os
 from pathlib import Path
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Enum, Float, JSON, Boolean, ForeignKey, Index
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, Text, Enum, Float, JSON, Boolean, ForeignKey, Index, text as _sql_text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 # Kreiraj SQLAlchemy engine sa stabilnom putanjom unutar projekta.
@@ -20,6 +20,25 @@ engine = create_engine(f"sqlite:///{DMS_DB_PATH.as_posix()}", echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
+
+
+def _ensure_dms_columns() -> None:
+    """Sigurna migracija za kolone dodane nakon inicijalnog kreiranja tabele."""
+    migrations = [
+        "ALTER TABLE dms_requests ADD COLUMN forward_count INTEGER DEFAULT 0",
+    ]
+    try:
+        with engine.connect() as conn:
+            for stmt in migrations:
+                try:
+                    conn.execute(_sql_text(stmt))
+                    conn.commit()
+                except Exception:
+                    pass  # kolona već postoji
+    except Exception:
+        pass  # tabela još ne postoji (novi install — create_all će je napraviti)
+
+_ensure_dms_columns()
 
 
 class RequestType(PyEnum):
@@ -103,6 +122,9 @@ class DmsRequest(Base):
     # Napomene
     notes = Column(Text, nullable=True)
     rejection_reason = Column(Text, nullable=True)
+
+    # Broj proslijeđivanja (max 2)
+    forward_count = Column(Integer, default=0, server_default="0")
 
     # Plaćanje takse (mock)
     payment_status = Column(String, nullable=True)  # not_required | pending | paid

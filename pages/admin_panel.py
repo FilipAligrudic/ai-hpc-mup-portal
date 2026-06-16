@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -12,11 +13,80 @@ from database.database import validate_user_session
 from database.database import get_staff_usernames
 from dms_core import DmsManager, RequestStatus, RequestType, RequestPriority
 from dms_core.models import DmsRequest, SessionLocal
+from pages.dms_requests import render_status_stepper
 from permissions import Role, get_effective_role, has_admin_access
 
 
 logger = logging.getLogger("dms_portal.admin")
 BASE_DIR = Path(__file__).resolve().parent.parent
+_MAX_FORWARDS = 2
+
+
+def _get_all_staff() -> list:
+    """Staff iz DB + env fallback kad je baza prazna (demo)."""
+    staff = get_staff_usernames()
+    if not staff:
+        env_raw = os.getenv("APP_ADMIN_USERS", "admin,rapoz")
+        staff = [u.strip() for u in env_raw.split(",") if u.strip()]
+    return staff
+
+
+def _render_forward_section(request, dms: DmsManager) -> None:
+    """UI sekcija za proslijeđivanje zahtjeva drugom službeniku."""
+    active_for_forward = {RequestStatus.UNDER_REVIEW, RequestStatus.SUBMITTED, RequestStatus.PENDING_USER}
+    if request.status not in active_for_forward:
+        return
+
+    forward_count = int(getattr(request, "forward_count", 0) or 0)
+    label = f"Proslijedi zahtjev  ({forward_count}/{_MAX_FORWARDS})"
+
+    with st.expander(label, expanded=False):
+        if forward_count >= _MAX_FORWARDS:
+            st.warning(
+                f"Zahtjev je već proslijeđen {_MAX_FORWARDS} puta. "
+                "Morate ga sami obraditi."
+            )
+            return
+
+        all_staff = _get_all_staff()
+        candidates = [s for s in all_staff if s != (request.assigned_to or "")]
+        if not candidates:
+            candidates = all_staff
+        if not candidates:
+            st.info("Nema dostupnih službenika za proslijeđivanje.")
+            return
+
+        to_user = st.selectbox(
+            "Proslijedi službeniku",
+            options=candidates,
+            key=f"forward_to_{request.id}",
+        )
+        forward_reason = st.text_input(
+            "Razlog proslijeđivanja (obavezno)",
+            placeholder="npr. Godišnji odmor, nije u nadležnosti, preopterećenost...",
+            key=f"forward_reason_{request.id}",
+        )
+
+        if st.button("Potvrdi proslijeđivanje", key=f"forward_submit_{request.id}"):
+            if not forward_reason.strip():
+                st.error("Razlog proslijeđivanja je obavezan.")
+                return
+            try:
+                dms.forward_request(
+                    request_id=request.id,
+                    from_user=st.session_state.user,
+                    to_user=to_user,
+                    reason=forward_reason.strip(),
+                )
+                st.success(f"Zahtjev proslijeđen službeniku **{to_user}**.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception:
+                logger.exception("Forward failed request_id=%s", request.id)
+                st.error("Greška pri proslijeđivanju. Pokušajte ponovo.")
+
+
 SESSION_FILE = BASE_DIR / "data" / "session.json"
 
 
@@ -45,6 +115,9 @@ def _restore_admin_session_if_possible() -> None:
 
 def _seed_demo_requests(dms: DmsManager, officer_username: str) -> dict:
     """Create a small realistic dataset for defense/demo sessions."""
+    if dms.db.query(DmsRequest).filter(DmsRequest.user_id.like("demo_%")).count() > 0:
+        return {"created": 0, "skipped": True}
+
     scenarios = [
         {
             "request_type": "PASOS",
@@ -301,8 +374,11 @@ def admin_dashboard() -> None:
             with action_col2:
                 if st.button("Generisi demo predmete", key="seed_demo_requests_dashboard"):
                     result = _seed_demo_requests(dms, st.session_state.user)
-                    st.success(f"Generisano demo predmeta: {result['created']}")
-                    st.rerun()
+                    if result.get("skipped"):
+                        st.warning("Demo podaci već postoje u bazi.")
+                    else:
+                        st.success(f"Generisano demo predmeta: {result['created']}")
+                        st.rerun()
 
             kpis = dms.get_kpi_metrics()
             kc1, kc2, kc3, kc4 = st.columns(4)
@@ -393,8 +469,11 @@ def admin_dashboard() -> None:
                 st.info("Nema aktivnih zahtjeva.")
                 if st.button("Generisi demo predmete", key="seed_demo_requests_queue"):
                     result = _seed_demo_requests(dms, st.session_state.user)
-                    st.success(f"Generisano demo predmeta: {result['created']}")
-                    st.rerun()
+                    if result.get("skipped"):
+                        st.warning("Demo podaci već postoje u bazi.")
+                    else:
+                        st.success(f"Generisano demo predmeta: {result['created']}")
+                        st.rerun()
             else:
                 st.markdown("### Bulk akcije")
                 staff_options = get_staff_usernames()
@@ -501,9 +580,12 @@ def admin_dashboard() -> None:
         db.close()
 
 
-def _render_request_detail(request, dms: DmsManager) -> None:
-    st.markdown(f"### Zahtjev #{request.id}")
-
+def _render_detail_info(request: DmsRequest) -> None:
+    render_status_stepper(
+        request.status,
+        assigned_to=request.assigned_to,
+        forward_count=getattr(request, "forward_count", 0) or 0,
+    )
     c1, c2, c3 = st.columns(3)
     c1.write(f"Korisnik: {request.user_id}")
     c1.write(f"Email: {request.user_email}")
@@ -524,6 +606,20 @@ def _render_request_detail(request, dms: DmsManager) -> None:
     else:
         st.caption("Nema uploadovanih dokumenata.")
 
+    if request.payment_status:
+        _PAYMENT_LABELS = {"not_required": "Nije potrebno", "pending": "Neplaćeno", "paid": "Plaćeno"}
+        st.caption(
+            f"Plaćanje: {_PAYMENT_LABELS.get(request.payment_status, request.payment_status)}"
+            + (f" • Ref: {request.payment_reference}" if request.payment_reference else "")
+        )
+    if request.signed_pdf_path and request.signature_hash:
+        st.caption(
+            f"E-potpis rješenja: hash {request.signature_hash[:16]}… "
+            f"({Path(request.signed_pdf_path).name})"
+        )
+
+
+def _render_detail_audit(request: DmsRequest, dms: DmsManager) -> None:
     st.markdown("#### Audit export")
     audit_payload = dms.build_audit_pack(request.id)
     chain_info = audit_payload.get("audit_chain", {})
@@ -538,25 +634,7 @@ def _render_request_detail(request, dms: DmsManager) -> None:
             "Audit log nije modifikovan."
         )
     else:
-        broken_id = chain_info.get("broken_at")
-        st.error(f"⚠️ Hash chain nije validan — prekid kod unosa #{broken_id}.")
-
-    if request.payment_status:
-        status_map = {
-            "not_required": "Nije potrebno",
-            "pending": "Neplaćeno",
-            "paid": "Plaćeno",
-        }
-        st.caption(
-            f"Plaćanje: {status_map.get(request.payment_status, request.payment_status)}"
-            + (f" • Ref: {request.payment_reference}" if request.payment_reference else "")
-        )
-
-    if request.signed_pdf_path and request.signature_hash:
-        st.caption(
-            f"E-potpis rješenja: hash {request.signature_hash[:16]}… "
-            f"({Path(request.signed_pdf_path).name})"
-        )
+        st.error(f"⚠️ Hash chain nije validan — prekid kod unosa #{chain_info.get('broken_at')}.")
 
     st.download_button(
         "Preuzmi audit JSON",
@@ -573,6 +651,8 @@ def _render_request_detail(request, dms: DmsManager) -> None:
         key=f"audit_export_csv_{request.id}",
     )
 
+
+def _render_detail_comments(request: DmsRequest, dms: DmsManager) -> None:
     st.markdown("#### Komunikacija")
     comments = dms.get_visible_comments(request.id, for_user=False)
     if comments:
@@ -597,15 +677,37 @@ def _render_request_detail(request, dms: DmsManager) -> None:
             st.success("Komentar je sačuvan.")
             st.rerun()
 
+
+def _render_detail_actions(request: DmsRequest, dms: DmsManager) -> None:
+    _render_forward_section(request, dms)
+
     st.markdown("#### Promjena statusa")
     available = dms.get_available_transitions(request.id)
     if not available:
         st.caption("Za trenutni status nema dostupnih tranzicija.")
         return
 
+    _QA_CONFIG = {
+        RequestStatus.UNDER_REVIEW: ("🔍 U obradu",      "secondary"),
+        RequestStatus.PENDING_USER: ("⏳ Zatraži dopunu", "secondary"),
+        RequestStatus.APPROVED:     ("✅ Odobri",         "primary"),
+        RequestStatus.REJECTED:     ("❌ Odbij",          "secondary"),
+        RequestStatus.COMPLETED:    ("📦 Završi",         "primary"),
+    }
+    qa_cols = st.columns(max(len(available), 1))
+    for col, avail_s in zip(qa_cols, available):
+        label, btn_type = _QA_CONFIG.get(avail_s, (avail_s.value, "secondary"))
+        with col:
+            if st.button(label, key=f"qa_{request.id}_{avail_s.value}", type=btn_type):
+                st.session_state[f"qa_sel_{request.id}"] = avail_s
+
+    qa_sel = st.session_state.get(f"qa_sel_{request.id}")
+    preselect_idx = available.index(qa_sel) if qa_sel and qa_sel in available else 0
+
     new_status = st.selectbox(
         "Novi status",
         options=available,
+        index=preselect_idx,
         format_func=_status_label,
         key=f"status_change_{request.id}",
     )
@@ -641,6 +743,7 @@ def _render_request_detail(request, dms: DmsManager) -> None:
                 request.rejection_reason = reason.strip()
                 dms.db.commit()
 
+            st.session_state.pop(f"qa_sel_{request.id}", None)
             st.success("Status je ažuriran.")
             if request.user_email:
                 st.info(f"📧 Notifikacija poslana korisniku: {request.user_email} — novi status: {_status_label(new_status)}")
@@ -652,6 +755,14 @@ def _render_request_detail(request, dms: DmsManager) -> None:
         except Exception:
             logger.exception("Unexpected admin status update failure request_id=%s", request.id)
             st.error("Doslo je do greske pri promjeni statusa. Pokusajte ponovo.")
+
+
+def _render_request_detail(request: DmsRequest, dms: DmsManager) -> None:
+    st.markdown(f"### Zahtjev #{request.id}")
+    _render_detail_info(request)
+    _render_detail_audit(request, dms)
+    _render_detail_comments(request, dms)
+    _render_detail_actions(request, dms)
 
 
 if __name__ == "__main__":

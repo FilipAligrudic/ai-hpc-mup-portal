@@ -5,6 +5,7 @@ Upravljanje zahtjevima kroz kompletan workflow
 
 import hashlib
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from dms_core.models import (
@@ -140,8 +141,15 @@ class DmsManager:
             return False
 
         if not staff:
-            self.logger.info("Auto-assign: nema registrovanih službenika, request_id=%s ostaje SUBMITTED", request_id)
-            return False
+            # Demo fallback: koristi APP_ADMIN_USERS env listu kao virtualne službenike
+            env_raw = os.getenv("APP_ADMIN_USERS", "admin,rapoz")
+            env_admins = [u.strip() for u in env_raw.split(",") if u.strip()]
+            if env_admins:
+                staff = env_admins
+                self.logger.info("Auto-assign: nema DB staff, fallback na env admins: %s", staff)
+            else:
+                self.logger.info("Auto-assign: nema registrovanih službenika, request_id=%s ostaje SUBMITTED", request_id)
+                return False
 
         active_statuses = [RequestStatus.SUBMITTED, RequestStatus.UNDER_REVIEW, RequestStatus.PENDING_USER]
 
@@ -177,6 +185,50 @@ class DmsManager:
         )
         return True
     
+    _MAX_FORWARDS = 2
+
+    def forward_request(
+        self,
+        request_id: int,
+        from_user: str,
+        to_user: str,
+        reason: str,
+    ) -> bool:
+        """Proslijedi zahtjev drugom službeniku (max _MAX_FORWARDS puta)."""
+        request = self._get_request(request_id)
+        if not request:
+            return False
+
+        current = int(request.forward_count or 0)
+        if current >= self._MAX_FORWARDS:
+            raise ValueError(
+                f"Zahtjev je već proslijeđen {self._MAX_FORWARDS} puta i ne može se dalje proslijeđivati."
+            )
+        if not reason or not reason.strip():
+            raise ValueError("Razlog proslijeđivanja je obavezan.")
+        if not to_user or not to_user.strip():
+            raise ValueError("Odredišni službenik je obavezan.")
+
+        old_assignee = request.assigned_to or "—"
+        request.assigned_to = to_user.strip()
+        request.forward_count = current + 1
+        request.updated_at = datetime.now()
+        self.db.commit()
+
+        self.add_comment(
+            request_id=request_id,
+            author=from_user,
+            content=f"Proslijeđeno od {old_assignee} → {to_user}. Razlog: {reason.strip()}",
+            author_type="admin",
+            is_internal=True,
+        )
+
+        self.logger.info(
+            "Forward request_id=%s %s→%s forward_count=%s",
+            request_id, old_assignee, to_user, request.forward_count,
+        )
+        return True
+
     def start_review(self, request_id: int, assigned_to: str) -> bool:
         """Počni pregled (SUBMITTED → UNDER_REVIEW)"""
         request = self._get_request(request_id)
